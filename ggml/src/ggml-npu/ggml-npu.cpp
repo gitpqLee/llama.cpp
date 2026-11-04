@@ -62,6 +62,9 @@ struct npu_device_context {
     bool catalog_loaded = false;
     std::vector<std::string> added;   // ggml_backend_npu_add_model paths
     std::vector<std::unique_ptr<npu_package>> catalog;
+    // what loading the catalog found, logged again by every backend init: the first load can happen while llama
+    // silences logging (its memory-fit dry run)
+    std::vector<std::pair<ggml_log_level, std::string>> catalog_log;
     std::vector<bool> consistent;     // per package: accepts every weight claimed so far
     bool matched = false;             // the last weight queried belongs to a consistent package
 
@@ -101,6 +104,11 @@ void probe(npu_device_context & ctx) {
     ctx.description = "Intel NPU " + ctx.key + " (" + std::to_string(ctx.tiles) + " tiles), whole-model DSL kernels";
 }
 
+void note(npu_device_context & ctx, ggml_log_level level, const std::string & message) {
+    ctx.catalog_log.emplace_back(level, message);
+    ggml_log_internal(level, "%s\n", message.c_str());
+}
+
 bool load_package(npu_device_context & ctx, const std::string & path) {
     for (const auto & p : ctx.catalog) {
         if (p->path == path) {
@@ -111,23 +119,25 @@ bool load_package(npu_device_context & ctx, const std::string & path) {
     pkg->path = path;
     char err[1024];
     if (npudsl_model_load(path.c_str(), &pkg->model, err, sizeof(err)) != NPUDSL_OK) {
-        GGML_LOG_WARN("NPU: ignoring model package %s: %s\n", path.c_str(), err);
+        note(ctx, GGML_LOG_LEVEL_WARN, "NPU: ignoring model package " + path + ": " + err);
         return false;
     }
     pkg->info.struct_size = sizeof(pkg->info);
     npudsl_model_get_info(pkg->model, &pkg->info);
     const auto & info = pkg->info;
     if (!info.n_sources || std::string(info.source_format) != "gguf") {
-        GGML_LOG_WARN("NPU: ignoring model package %s: it has no GGUF sources\n", path.c_str());
+        note(ctx, GGML_LOG_LEVEL_WARN, "NPU: ignoring model package " + path + ": it has no GGUF sources");
         return false;
     }
     if (ctx.present && (info.device_key != ctx.key || info.tiles != ctx.tiles)) {
-        GGML_LOG_INFO("NPU: ignoring model package %s: built for %s/%u tiles, device is %s/%u tiles\n", path.c_str(),
-                      info.device_key, info.tiles, ctx.key.c_str(), ctx.tiles);
+        note(ctx, GGML_LOG_LEVEL_WARN, "NPU: ignoring model package " + path + ": built for " + info.device_key + "/" +
+                                           std::to_string(info.tiles) + " tiles, device is " + ctx.key + "/" +
+                                           std::to_string(ctx.tiles) + " tiles");
         return false;
     }
-    GGML_LOG_INFO("NPU: model package %s (%s, %u layers, %u source tensors) from %s\n", info.name, info.source_arch,
-                  info.n_layers, info.n_sources, path.c_str());
+    note(ctx, GGML_LOG_LEVEL_INFO, std::string("NPU: model package ") + info.name + " (" + info.source_arch + ", " +
+                                   std::to_string(info.n_layers) + " layers, " + std::to_string(info.n_sources) +
+                                   " source tensors) from " + path);
     ctx.catalog.push_back(std::move(pkg));
     ctx.consistent.push_back(true);
     return true;
@@ -141,7 +151,7 @@ void load_path(npu_device_context & ctx, const std::string & path) {
         return;
     }
     if (!fs::is_directory(path, ec)) {
-        GGML_LOG_WARN("NPU: model package path %s does not exist\n", path.c_str());
+        note(ctx, GGML_LOG_LEVEL_WARN, "NPU: model package path " + path + " does not exist");
         return;
     }
     if (fs::is_regular_file(fs::path(path) / "model.json", ec)) {
@@ -551,6 +561,17 @@ void npu_dev_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
 }
 
 ggml_backend_t npu_dev_init_backend(ggml_backend_dev_t dev, const char *) {
+    auto & ctx = device_context();
+    {
+        std::lock_guard<std::recursive_mutex> lock(ctx.mutex);
+        load_catalog(ctx);
+        for (const auto & m : ctx.catalog_log) {
+            ggml_log_internal(m.first, "%s\n", m.second.c_str());
+        }
+        if (ctx.catalog.empty()) {
+            GGML_LOG_INFO("NPU: no usable model package (GGML_NPU_MODELS); every model runs on the other backends\n");
+        }
+    }
     return new ggml_backend{npu_guid(), npu_backend_iface, dev, nullptr};
 }
 

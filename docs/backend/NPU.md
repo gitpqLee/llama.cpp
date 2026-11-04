@@ -42,6 +42,9 @@ GGML_NPU_MODELS=<dir with model.json, or model.json paths separated by ':' (';' 
 
 The log names the package found (`NPU: model package ...`) and bound (`NPU: running ...`).
 
+Hardware validation steps (build on Windows, compare the generic runner with `qwen36_run --single` on the device,
+check this backend's plumbing) are in [model_runner/HOW_TO_RUN.md](../../../libraries.npu.dsl/model_runner/HOW_TO_RUN.md).
+
 ## Limits (fail with an error, never wrong output)
 
 - One NPU model per process; one sequence (`-np 1`), token ids only (no embedding / mixed multimodal batches).
