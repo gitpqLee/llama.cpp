@@ -67,6 +67,7 @@ struct npu_device_context {
     std::vector<std::pair<ggml_log_level, std::string>> catalog_log;
     std::vector<bool> consistent;     // per package: accepts every weight claimed so far
     bool matched = false;             // the last weight queried belongs to a consistent package
+    std::string rejected;             // why the first rejected weight was refused (bind's error names it)
 
     const npu_package * bound = nullptr;
     npudsl_runner * runner = nullptr;
@@ -205,6 +206,33 @@ bool accepts(const npu_package & pkg, const ggml_tensor * t) {
 
 enum class weight_kind { source, rejected, other };
 
+std::string shape_text(const int64_t * ne, uint32_t n) {
+    std::string s = "[";
+    for (uint32_t d = 0; d < n; ++d) {
+        s += (d ? ", " : "") + std::to_string(ne[d]);
+    }
+    return s + "]";
+}
+
+// "blk.0.x.weight is q4_0 [64, 32]; qwen36 takes f32/f16/bf16 [64, 32]"
+std::string rejection(const npu_device_context & ctx, const ggml_tensor * w) {
+    std::string s = std::string(w->name) + " is " + ggml_type_name(w->type) + " " + shape_text(w->ne, uint32_t(ggml_n_dims(w)));
+    for (const auto & pkg : ctx.catalog) {
+        const int64_t i = npudsl_model_find_source(pkg->model, w->name);
+        npudsl_source_info si = {};
+        si.struct_size = sizeof(si);
+        if (i < 0 || npudsl_model_source(pkg->model, uint32_t(i), &si) != NPUDSL_OK) {
+            continue;
+        }
+        s += std::string("; ") + pkg->info.name + " takes ";
+        for (uint32_t t = 0; t < si.n_types; ++t) {
+            s += (t ? "/" : "") + std::string(si.types[t]);
+        }
+        s += " " + shape_text(si.ne, si.n_dims);
+    }
+    return s;
+}
+
 // A weight is a source of a package that also accepted every source claimed before it, a source name no such
 // package accepts (another model: its graph stays on the other backends), or no package's source at all (the KV and
 // recurrent state llama flags as weights). The scheduler queries a graph's ops in order, so a model's first weight
@@ -223,6 +251,9 @@ weight_kind classify_weight(npu_device_context & ctx, const ggml_tensor * w) {
     }
     if (!any) {
         ctx.matched = false;
+        if (ctx.rejected.empty()) {
+            ctx.rejected = rejection(ctx, w);
+        }
         return weight_kind::rejected;
     }
     for (size_t i = 0; i < ctx.catalog.size(); ++i) {
@@ -330,8 +361,12 @@ bool bind(npu_device_context & ctx, ggml_cgraph * graph) {
         }
     }
     if (!pick) {
-        GGML_LOG_ERROR("NPU: the graph references no complete model package (%s is missing or different)\n",
-                       missing.empty() ? "every source" : missing.c_str());
+        if (!ctx.rejected.empty()) {   // a weight of the model was refused, so its ops (and the split) went elsewhere
+            GGML_LOG_ERROR("NPU: the GGUF does not fit the model package: %s\n", ctx.rejected.c_str());
+        } else {
+            GGML_LOG_ERROR("NPU: the graph references no complete model package (%s is missing or different)\n",
+                           missing.empty() ? "every source" : missing.c_str());
+        }
         return false;
     }
     if (const ggml_tensor * w = foreign(*pick)) {

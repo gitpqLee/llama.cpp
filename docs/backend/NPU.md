@@ -42,6 +42,21 @@ GGML_NPU_MODELS=<dir with model.json, or model.json paths separated by ':' (';' 
 
 The log names the package found (`NPU: model package ...`) and bound (`NPU: running ...`).
 
+## Which GGUF
+
+The NPU runs a model's own kernels with their own weight layout; a GGUF works if it carries exactly the tensors the
+package's `sources` name, in an accepted type. For quantized weights the recommendation is **symmetric int4**: the
+kernels take Q4_0 blocks as they are when the model's group is 32, and for group-128 kernels (Qwen3.6) a Q4_0 whose
+four 32-blocks of each group share one scale. Such a GGUF is still an ordinary Q4_0 file for every other backend.
+`llama-quantize` sets a scale per 32 values, so for group-128 kernels convert the int4 checkpoint directly:
+
+```sh
+python <libraries.npu.dsl>/model_runner/tools/hf_to_gguf_lossless.py --llama . --model <W4A16 checkpoint> --outfile model.gguf
+```
+
+A GGUF the kernels cannot take exactly is refused at bind time with the tensor's name; the CPU then runs nothing in
+its place (the graph fails), so pick the model with `-dev none` instead of `-dev NPU`.
+
 Hardware validation steps (build on Windows, compare the generic runner with `qwen36_run --single` on the device,
 check this backend's plumbing) are in [model_runner/HOW_TO_RUN.md](../../../libraries.npu.dsl/model_runner/HOW_TO_RUN.md).
 
