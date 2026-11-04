@@ -1,0 +1,30 @@
+ggml_add_backend_library(ggml-npu ggml-npu.cpp)
+target_compile_features(ggml-npu PRIVATE cxx_std_17)
+
+# The generic whole-model runner of libraries.npu.dsl. It names no model: packages are model.json files found at
+# run time (GGML_NPU_MODELS), their kernels linked into the runner by the DSL build (NPUDSL_RUNNER_MODEL_DIRS).
+option(GGML_NPU_MOCK_RUNTIME "ggml-npu: link the runner against the mock NPU runtime (host tests, no device)" OFF)
+set(GGML_NPU_MODELS_DIR "" CACHE PATH "ggml-npu: default model package directory, searched after GGML_NPU_MODELS")
+
+# the runner resolves GENERIC_COMPUTE_ROOT (cache or environment) itself
+if (NOT NPU_DSL_ROOT AND DEFINED ENV{NPU_DSL_ROOT})
+    set(NPU_DSL_ROOT "$ENV{NPU_DSL_ROOT}")
+endif()
+set(NPU_DSL_ROOT "${NPU_DSL_ROOT}" CACHE PATH "ggml-npu: path to the libraries.npu.dsl checkout")
+if (NOT NPU_DSL_ROOT)
+    message(FATAL_ERROR "GGML_NPU requires NPU_DSL_ROOT (a libraries.npu.dsl checkout)")
+endif()
+if (NOT TARGET npudsl_runner)
+    if (NOT EXISTS "${NPU_DSL_ROOT}/model_runner/CMakeLists.txt")
+        message(FATAL_ERROR "NPU_DSL_ROOT must contain model_runner/CMakeLists.txt")
+    endif()
+    set(NPUDSL_RUNNER_MOCK ${GGML_NPU_MOCK_RUNTIME} CACHE BOOL "" FORCE)
+    add_subdirectory("${NPU_DSL_ROOT}/model_runner" "${CMAKE_CURRENT_BINARY_DIR}/model_runner")
+endif()
+if (NOT TARGET npudsl_runner)
+    message(FATAL_ERROR "GGML_NPU: no NPU runtime -- set GENERIC_COMPUTE_ROOT, or GGML_NPU_MOCK_RUNTIME=ON for host tests")
+endif()
+target_link_libraries(ggml-npu PRIVATE npudsl_runner)
+if (GGML_NPU_MODELS_DIR)
+    target_compile_definitions(ggml-npu PRIVATE GGML_NPU_MODELS_DIR="${GGML_NPU_MODELS_DIR}")
+endif()

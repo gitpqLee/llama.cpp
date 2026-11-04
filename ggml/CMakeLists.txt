@@ -261,6 +261,7 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+option(GGML_NPU                             "ggml: register the Intel NPU whole-model DSL backend" OFF)
 option(GGML_ET                              "ggml: use ET backend"                            OFF)
 option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
 
@@ -336,6 +337,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cuda.h
     include/ggml-opt.h
     include/ggml-metal.h
+    include/ggml-npu.h
     include/ggml-rpc.h
     include/ggml-virtgpu.h
     include/ggml-sycl.h
