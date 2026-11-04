@@ -213,6 +213,12 @@ add_compile_options(
 # 3rd-party
 #
 
+# Enable testing before descending into optional backend/session projects, so
+# their tests are reachable from the root CTest invocation too.
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
+    include(CTest)
+endif()
+
 if (LLAMA_USE_SYSTEM_GGML)
     message(STATUS "Using system-provided libggml, skipping ggml build")
     find_package(ggml REQUIRED)

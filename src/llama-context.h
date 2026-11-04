@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_npu;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -234,6 +235,10 @@ private:
     // Returns max number of outputs for which space was reserved.
     uint32_t output_reserve(int32_t n_outputs);
 
+    void init_npu(const llama_context_params & params);
+    int decode_npu(const llama_batch_ext & batch);
+    void invalidate_npu_output();
+
     void output_reorder();
 
     // map the output row index `i` to batch index
@@ -307,6 +312,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    llama_npu * npu = nullptr; // owned by memory
+    bool npu_unsupported = false;
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-npu.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -14,6 +15,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -175,6 +177,7 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    cparams{},
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     // MTP uses the embd input for the hidden state
@@ -186,6 +189,12 @@ llama_context::llama_context(
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
+
+    // vocab_only skips hparams loading. Do not read those fields or create graph backends.
+    if (params.npu_model_path != nullptr) {
+        init_npu(params);
+        return;
+    }
 
     const auto & hparams = model.hparams;
 
@@ -607,6 +616,71 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+void llama_context::init_npu(const llama_context_params & params) {
+    auto bridge = std::make_unique<llama_npu>(model, params);
+    npu = bridge.get();
+    memory = std::move(bridge);
+
+    cparams.n_ctx = params.n_ctx ? params.n_ctx : npu->context_size();
+    cparams.n_ctx_seq = cparams.n_ctx;
+    cparams.n_batch = std::min(params.n_batch, cparams.n_ctx);
+    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch ? params.n_ubatch : cparams.n_batch);
+    cparams.n_seq_max = 1;
+    cparams.n_outputs_max = 1;
+    cparams.n_outputs_max_per_seq = 1;
+    cparams.n_threads = params.n_threads;
+    cparams.n_threads_batch = params.n_threads_batch;
+    cparams.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+    cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    cparams.causal_attn = true;
+    cparams.no_perf = params.no_perf;
+    cparams.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_NONE;
+    cparams.rope_freq_scale = 1.0f;
+    cparams.embeddings_layer_inp.resize(npu->layer_count() + 1, false);
+    embd_layer_inp.resize(npu->layer_count() + 1, {nullptr, 0});
+    if (output_reserve(1) < 1) { throw std::runtime_error("NPU: output allocation failed"); }
+    invalidate_npu_output();
+}
+
+void llama_context::invalidate_npu_output() {
+    n_outputs = 0;
+    output_swaps.clear();
+    std::fill(output_ids.begin(), output_ids.end(), -1);
+    if (logits.data) { std::fill_n(logits.data, logits.size, 0.0f); }
+}
+
+int llama_context::decode_npu(const llama_batch_ext & batch) {
+    invalidate_npu_output();
+    try {
+        if (npu_unsupported || cparams.embeddings || cparams.embeddings_nextn || !cparams.causal_attn ||
+            cparams.warmup || cparams.training || cparams.nextn_layer_offset || abort_callback ||
+            !loras->empty() || !sampling.samplers.empty() ||
+            std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; }) ||
+            batch.tokens.empty() || batch.tokens.size() > cparams.n_batch || batch.tokens.size() > cparams.n_ubatch) {
+            throw std::runtime_error("NPU: unsupported feature or batch size");
+        }
+        const auto start = ggml_time_us();
+        npu->evaluate(batch, cparams.n_ctx, logits.data);
+        const bool output = batch.tokens.back().output;
+        n_outputs = output ? 1 : 0;
+        if (output) { output_ids[batch.tokens.size() - 1] = 0; }
+        else { std::fill_n(logits.data, logits.size, 0.0f); }
+        if (batch.tokens.size() == 1) {
+            ++n_eval;
+            if (!cparams.no_perf) { t_eval_us += ggml_time_us() - start; }
+        } else {
+            n_p_eval += batch.tokens.size();
+            if (!cparams.no_perf) { t_p_eval_us += ggml_time_us() - start; }
+        }
+        has_evaluated_once = true;
+        return 0;
+    } catch (const std::exception & err) {
+        invalidate_npu_output();
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return -1;
+    }
+}
+
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
@@ -730,6 +804,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 }
 
 void llama_context::sched_reserve() {
+    if (npu) { return; }
     if (!sched_need_reserve) {
         return;
     }
@@ -964,6 +1039,10 @@ llama_memory_t llama_context::get_memory() const {
 }
 
 bool llama_context::memory_update(bool optimize) {
+    if (npu) {
+        LLAMA_LOG_ERROR("NPU: graph memory updates are not supported\n");
+        return false;
+    }
     if (!memory) {
         return false;
     }
@@ -1028,6 +1107,7 @@ enum llama_pooling_type llama_context::pooling_type() const {
 }
 
 float * llama_context::get_logits() {
+    if (npu && !n_outputs) { return nullptr; }
     output_reorder();
 
     return logits.data;
@@ -1063,6 +1143,9 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 }
 
 float * llama_context::get_logits_ith(int32_t i) {
+    if (npu && (!n_outputs || (i >= 0 && (size_t(i) >= output_ids.size() || output_ids[i] < 0)) || i < -1)) {
+        return nullptr;
+    }
     output_reorder();
 
     try {
@@ -1362,6 +1445,11 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+    if (npu) {
+        if (lid >= cparams.embeddings_layer_inp.size()) { npu_unsupported = true; }
+        else { cparams.embeddings_layer_inp[lid] = enable; }
+        return;
+    }
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
     GGML_ASSERT(lid <= model.hparams.n_layer());
@@ -1407,6 +1495,11 @@ void llama_context::set_warmup(bool value) {
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+    if (npu && sampler) {
+        npu_unsupported = true;
+        LLAMA_LOG_ERROR("NPU: backend samplers are not supported\n");
+        return false;
+    }
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
     }
@@ -1513,6 +1606,11 @@ bool llama_context::set_adapter_cvec(
                 int32_t   n_embd,
                 int32_t   il_start,
                 int32_t   il_end) {
+    if (npu) {
+        npu_unsupported = true;
+        LLAMA_LOG_ERROR("NPU: control vectors are not supported\n");
+        return false;
+    }
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
@@ -1523,6 +1621,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (npu) {
+        ret = GGML_STATUS_FAILED;
+        LLAMA_LOG_ERROR("NPU: GGML graph execution is not supported by the model session\n");
+        return nullptr;
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1598,6 +1701,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (npu) { invalidate_npu_output(); LLAMA_LOG_ERROR("NPU: encode is not supported\n"); return -1; }
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1841,6 +1945,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (npu) { return decode_npu(batch_inp); }
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2326,7 +2431,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
         auto * buft = ggml_backend_cpu_buffer_type();
         // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
-        auto * output_dev = model.dev_output();
+        auto * output_dev = npu ? nullptr : model.dev_output();
         auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
@@ -2643,6 +2748,10 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    if (npu) {
+        LLAMA_LOG_ERROR("NPU: GGML graph reservation is not supported by the model session\n");
+        return nullptr;
+    }
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -3435,6 +3544,7 @@ private:
 };
 
 size_t llama_context::state_get_size() {
+    if (npu) { LLAMA_LOG_ERROR("NPU: state save is not supported\n"); return 0; }
     llama_io_write_dummy io(false);
     try {
         return state_write_data(io);
@@ -3445,6 +3555,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: state save is not supported\n"); return 0; }
     llama_io_write_host io(dst, size);
     try {
         return state_write_data(io);
@@ -3455,6 +3566,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: state load is not supported\n"); return 0; }
     llama_io_read_host io(src, size);
     try {
         return state_read_data(io);
@@ -3468,6 +3580,7 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: sequence state save is not supported\n"); return 0; }
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
         io.write(&io_magic, sizeof(io_magic));
@@ -3481,6 +3594,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: sequence state save is not supported\n"); return 0; }
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -3500,6 +3614,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: sequence state load is not supported\n"); return 0; }
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
@@ -3540,6 +3655,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 }
 
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: state load is not supported\n"); return false; }
     llama_file file(filepath, "rb");
 
     // sanity checks
@@ -3583,6 +3699,7 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
 }
 
 bool llama_context::state_save_file(const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: state save is not supported\n"); return false; }
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);
@@ -3600,6 +3717,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 }
 
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: sequence state load is not supported\n"); return 0; }
     llama_file file(filepath, "rb");
 
     // version checks
@@ -3654,6 +3772,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
+    if (npu) { LLAMA_LOG_ERROR("NPU: sequence state save is not supported\n"); return 0; }
     llama_file file(filepath, "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
@@ -3817,6 +3936,11 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+    if (npu) {
+        npu_unsupported = true;
+        LLAMA_LOG_ERROR("NPU: training is not supported\n");
+        return;
+    }
     GGML_ASSERT(!opt_ctx);
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
@@ -4081,6 +4205,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.npu_model_path              =*/ nullptr,
     };
 
     return result;
@@ -4094,12 +4219,19 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // Caller-controlled enums must be bounded before GGML's asserting helpers.
+    if (int(params.type_k) < 0 || int(params.type_k) >= GGML_TYPE_COUNT ||
+        int(params.type_v) < 0 || int(params.type_v) >= GGML_TYPE_COUNT) {
+        LLAMA_LOG_ERROR("%s: invalid K/V cache type enum\n", __func__);
+        return nullptr;
+    }
+
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
     }
 
-    if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
+    if (params.npu_model_path == nullptr && params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
         return nullptr;
     }
@@ -4667,11 +4799,36 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 // compat: llama_batch -> llama_batch_ext -> encode/decode
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    if (npu) { invalidate_npu_output(); LLAMA_LOG_ERROR("NPU: encode is not supported\n"); return -1; }
     llama_batch_compat compat(this, batch_inp, model.hparams.n_embd_inp_enc());
     return encode(*compat.batch_ext);
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (npu) {
+        invalidate_npu_output();
+        // Validate before the compat converter indexes sequence ids or copies embeddings.
+        if (batch_inp.n_tokens <= 0 || uint32_t(batch_inp.n_tokens) > cparams.n_batch ||
+            uint32_t(batch_inp.n_tokens) > cparams.n_ubatch ||
+            !batch_inp.token || batch_inp.embd) {
+            LLAMA_LOG_ERROR("NPU: decode requires a nonempty token-only batch\n");
+            return -1;
+        }
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            if ((batch_inp.n_seq_id && batch_inp.n_seq_id[i] != 1) ||
+                (batch_inp.seq_id && (!batch_inp.seq_id[i] || batch_inp.seq_id[i][0] != 0))) {
+                LLAMA_LOG_ERROR("NPU: only sequence {0} is supported\n");
+                return -1;
+            }
+        }
+        try {
+            llama_batch_compat compat(this, batch_inp);
+            return decode_npu(*compat.batch_ext);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("NPU: batch conversion failed: %s\n", err.what());
+            return -1;
+        }
+    }
     llama_batch_compat compat(this, batch_inp);
     return decode(*compat.batch_ext);
 }

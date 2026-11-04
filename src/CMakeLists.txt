@@ -15,6 +15,7 @@ set(LLAMA_CORE_SOURCES
     llama-batch.cpp
     llama-chat.cpp
     llama-context.cpp
+    llama-npu.cpp
     llama-cparams.cpp
     llama-grammar.cpp
     llama-graph.cpp
@@ -71,8 +72,19 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (GGML_NPU AND TARGET npudsl_model_api)
+    target_compile_definitions(llama PRIVATE LLAMA_NPU_MODEL)
+    target_link_libraries(llama PRIVATE npudsl_model_api)
+    target_sources(llama PRIVATE ../vendor/hash/sha256/sha256.c)
+    target_include_directories(llama PRIVATE ../vendor ../vendor/hash)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+endif()
+
+if (GGML_NPU)
+    add_subdirectory(../examples/npu-model ${CMAKE_BINARY_DIR}/examples/npu-model)
 endif()

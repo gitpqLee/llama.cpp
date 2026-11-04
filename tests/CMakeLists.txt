@@ -419,3 +419,51 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# Complete-model NPU contract tests use only exported public llama APIs.
+llama_build_and_test(test-npu-model-contract.cpp LABEL "main npu contract" LINK llama)
+if (TARGET llama-npu-model)
+    foreach(case help missing negative overflow unknown)
+        add_test(NAME test-npu-model-cli-${case} COMMAND ${CMAKE_COMMAND}
+            "-DPROGRAM=$<TARGET_FILE:llama-npu-model>" "-DCASE=${case}"
+            -P "${PROJECT_SOURCE_DIR}/examples/npu-model/check-cli.cmake")
+        set_tests_properties(test-npu-model-cli-${case} PROPERTIES LABELS "npu;contract" TIMEOUT 30)
+    endforeach()
+endif()
+set(LLAMA_NPU_MODEL_TOKENIZER "" CACHE FILEPATH "Explicit bound tokenizer GGUF for NPU full-model test")
+set(LLAMA_NPU_MODEL_WEIGHTS "" CACHE PATH "Explicit verified packed package for NPU full-model test")
+if (LLAMA_NPU_MODEL_TOKENIZER OR LLAMA_NPU_MODEL_WEIGHTS)
+    if (NOT TARGET llama-npu-model OR NOT LLAMA_NPU_MODEL_TOKENIZER OR NOT LLAMA_NPU_MODEL_WEIGHTS)
+        message(FATAL_ERROR "NPU full-model test requires llama-npu-model and both explicit fixture paths")
+    endif()
+    add_test(NAME test-npu-model-full COMMAND llama-npu-model
+        --model "${LLAMA_NPU_MODEL_TOKENIZER}" --weights "${LLAMA_NPU_MODEL_WEIGHTS}"
+        --prompt "Hello" --predict 2 --ctx-size 128)
+    set_tests_properties(test-npu-model-full PROPERTIES LABELS "npu;model;smoke" TIMEOUT 1800 RUN_SERIAL TRUE)
+else()
+    add_test(NAME test-npu-model-full COMMAND test-npu-model-contract --skip-full)
+    set_tests_properties(test-npu-model-full PROPERTIES LABELS "npu;model" SKIP_RETURN_CODE 77)
+endif()
+
+# Host-only PUBLIC llama context bridge contract, not model math. Defining the
+# complete session API in the executable keeps the single real session object
+# out of its static archive; never use force-load/whole-archive for this test.
+if (GGML_NPU AND NOT BUILD_SHARED_LIBS AND TARGET qwen36_session)
+    get_target_property(_npu_context_session_type qwen36_session TYPE)
+    get_target_property(_npu_context_llama_type llama TYPE)
+    if (_npu_context_session_type STREQUAL "STATIC_LIBRARY" AND
+        _npu_context_llama_type STREQUAL "STATIC_LIBRARY")
+        add_executable(test-npu-context test-npu-context.cpp
+            "${PROJECT_SOURCE_DIR}/vendor/hash/sha256/sha256.c")
+        target_compile_features(test-npu-context PRIVATE cxx_std_17)
+        target_include_directories(test-npu-context PRIVATE
+            "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/vendor"
+            "${PROJECT_SOURCE_DIR}/vendor/hash"
+            "$<TARGET_PROPERTY:qwen36_session,INTERFACE_INCLUDE_DIRECTORIES>")
+        target_link_libraries(test-npu-context PRIVATE llama)
+        target_link_libraries(test-npu-context PRIVATE npudsl_model_api)
+        llama_test(test-npu-context LABEL npu)
+        set_tests_properties(test-npu-context PROPERTIES
+            LABELS "npu;contract;mock;host;no-model-math" TIMEOUT 120)
+    endif()
+endif()

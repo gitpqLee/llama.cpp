@@ -426,6 +426,10 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // Explicit model-only DSL execution; requires a vocab-only GGUF and a verified package.
+        // No environment activation. The directory is copied during context creation.
+        const char * npu_model_path;
     };
 
     struct llama_model_tensor_override {
@@ -595,6 +599,11 @@ extern "C" {
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
+    // Loaded-tokenizer fingerprint used by the NPU package contract. No device or package access.
+    // Writes 64 lowercase hex characters and NUL. Returns false for null arguments, size < 65,
+    // hashing failure, or a build without the complete-model NPU bridge. Clears output on failure.
+    LLAMA_API bool llama_npu_tokenizer_sha256(const struct llama_model * model, char * output, size_t size);
+
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);

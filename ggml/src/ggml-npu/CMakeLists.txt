@@ -1,0 +1,23 @@
+ggml_add_backend_library(ggml-npu ggml-npu.cpp)
+target_compile_features(ggml-npu PRIVATE cxx_std_17)
+
+if (NPU_DSL_ROOT AND NOT TARGET npudsl_model_api)
+    set(npu_session_dir "${NPU_DSL_ROOT}/model_api")
+    if (NOT EXISTS "${npu_session_dir}/CMakeLists.txt")
+        message(FATAL_ERROR "NPU_DSL_ROOT must contain model_api/CMakeLists.txt")
+    endif()
+    add_subdirectory("${npu_session_dir}" "${CMAKE_CURRENT_BINARY_DIR}/model-api")
+endif()
+
+if (TARGET npu_runtime)
+    target_link_libraries(ggml-npu PRIVATE npu_runtime)
+    target_compile_definitions(ggml-npu PRIVATE GGML_NPU_RUNTIME)
+else()
+    message(STATUS "NPU: no DSL runtime linked; registration will expose zero devices")
+endif()
+
+option(GGML_NPU_TESTS "Build NPU registration contract tests (no model computation)" OFF)
+if (GGML_NPU_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
