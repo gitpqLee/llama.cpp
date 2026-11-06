@@ -402,8 +402,15 @@ bool bind(npu_device_context & ctx, ggml_cgraph * graph) {
     }
     ctx.bound = pick;
     ctx.logits.assign(pick->info.vocab, 0.0f);
+    npudsl_setup_stats st = {};
+    st.struct_size = sizeof(st);
+    npudsl_runner_setup_stats(ctx.runner, &st);
     GGML_LOG_INFO("NPU: running %s from %s (%u source tensors converted, max_seq %u)\n", pick->info.name,
                   pick->path.c_str(), pick->info.n_sources, pick->info.max_seq);
+    GGML_LOG_INFO("NPU: setup %.1f s: create %.1f s, %u imports of %.1f GB in %.1f s on %u threads, prepare %.1f s "
+                  "(zero-filling state and buffers %.1f s of it)\n", (st.create_us + st.import_us + st.prepare_us) / 1e6,
+                  st.create_us / 1e6, st.import_calls, st.import_bytes / 1e9, st.import_us / 1e6, st.threads,
+                  st.prepare_us / 1e6, st.zero_us / 1e6);
     return true;
 }
 
