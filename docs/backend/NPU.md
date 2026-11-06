@@ -113,6 +113,7 @@ the GGUFs. The target machine needs the NPU driver only -- no DSL repository, mo
 | `... not found in kernel registry (kernel file: no ...\npu<key>_<kernel>.elf)` | the model directory lacks a kernel: rerun step 2a |
 | `NPU: the model state is at position ..., the batch starts at ...` | a sequence jump the kernels cannot do (prompt-cache reuse, context shift): see the llama-server flags |
 | first evaluation slow | the GGUF's weights are converted once per process (`NPU: setup ...` shows the time) |
+| `NPU: ... GB of weights, twice resident while converted, against ... GB of memory` | the GGUF and its converted copy do not both fit in memory: the GGUF's pages are released as they are converted (`GGML_NPU_RELEASE_SOURCES=1` / `0` forces it on / off) |
 
 ## Limits (fail with an error, never wrong output)
 

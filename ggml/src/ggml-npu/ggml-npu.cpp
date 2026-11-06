@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -36,19 +37,10 @@
 #    ifndef NOMINMAX
 #        define NOMINMAX
 #    endif
-#    ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#    endif
-#    include <windows.h>
-#endif
-
-#if defined(_WIN32)
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
 #    include <windows.h>
 #else
 #    include <unistd.h>
+#    include <sys/mman.h>
 #endif
 
 namespace {
@@ -331,6 +323,81 @@ std::vector<int32_t> read_i32(const ggml_tensor * t, int64_t n) {
     return v;
 }
 
+// Residency hints for the host memory of a source tensor (llama.cpp's mmap of the GGUF, or a host buffer). Converted,
+// a source is never read again on the host -- the whole model runs on the NPU -- yet the GGUF stays mapped and, on
+// Windows, prefetched whole at load: with the converted copy in NPU-visible host memory the weights are resident
+// twice (Qwen3.6: 2 x 20 GB on a 32 GB machine), and the allocation and the conversion page against each other. So
+// when the two copies do not comfortably fit, every source is released before the runner allocates, read ahead just
+// before it is converted, and released after.
+// Both hints keep the data: released pages are written back or re-read from the file if ever touched again.
+void host_pages(const void * data, size_t bytes, bool will_need) {
+    if (!data || !bytes) {
+        return;
+    }
+#if defined(_WIN32)
+    if (will_need) {
+        struct range { void * address; SIZE_T bytes; };   // WIN32_MEMORY_RANGE_ENTRY (Windows 8+)
+        using prefetch_fn = BOOL(WINAPI *)(HANDLE, ULONG_PTR, range *, ULONG);
+        static const auto prefetch = reinterpret_cast<prefetch_fn>(
+            reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory")));
+        if (prefetch) {
+            range r = {const_cast<void *>(data), SIZE_T(bytes)};
+            prefetch(GetCurrentProcess(), 1, &r, 0);
+        }
+    } else {
+        VirtualUnlock(const_cast<void *>(data), SIZE_T(bytes));   // pages not locked leave the working set
+    }
+#elif defined(__linux__)
+    const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
+    uintptr_t a = uintptr_t(data), e = a + bytes;
+    if (will_need) {
+        a &= ~(page - 1);
+        e = (e + page - 1) & ~(page - 1);
+        madvise(reinterpret_cast<void *>(a), e - a, MADV_WILLNEED);
+    } else {
+        a = (a + page - 1) & ~(page - 1);   // whole pages of this tensor only
+        e &= ~(page - 1);
+#    if defined(MADV_PAGEOUT)
+        if (e > a) {
+            madvise(reinterpret_cast<void *>(a), e - a, MADV_PAGEOUT);
+        }
+#    endif
+    }
+#else
+    GGML_UNUSED(will_need);
+#endif
+}
+
+// physical memory of the machine, 0 if unknown
+uint64_t physical_memory() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX m = {};
+    m.dwLength = sizeof(m);
+    return GlobalMemoryStatusEx(&m) ? uint64_t(m.ullTotalPhys) : 0;
+#elif defined(_SC_PHYS_PAGES)
+#    if defined(__linux__)
+    // /proc/meminfo first: in a container it is the container's memory (sysconf reports the host's)
+    if (FILE * f = fopen("/proc/meminfo", "r")) {
+        unsigned long long kb = 0;
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+                break;
+            }
+        }
+        fclose(f);
+        if (kb) {
+            return uint64_t(kb) * 1024;
+        }
+    }
+#    endif
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? uint64_t(pages) * uint64_t(page) : 0;
+#else
+    return 0;
+#endif
+}
+
 // the package whose every source this graph references; its runner, with the sources converted from their data
 const ggml_tensor * base_of(const ggml_tensor * t) {
     while (t && t->view_src) {
@@ -422,6 +489,27 @@ bool bind(npu_device_context & ctx, ggml_cgraph * graph) {
         return false;
     }
     ctx.unbind();
+    npudsl_source_info si = {};
+    si.struct_size = sizeof(si);
+    // The sources resident next to their converted copy: when that does not comfortably fit, the sources leave memory
+    // before their copy arrives (with memory to spare, releasing would only make the conversion re-read them).
+    uint64_t source_bytes = 0;
+    for (uint32_t i = 0; i < pick->info.n_sources; ++i) {
+        npudsl_model_source(pick->model, i, &si);
+        source_bytes += ggml_nbytes(weights.at(si.name));
+    }
+    const uint64_t ram = physical_memory();
+    const char * force = getenv("GGML_NPU_RELEASE_SOURCES");   // "1" / "0": on / off regardless of the memory
+    const bool release = force ? std::string(force) != "0" : ram && 2 * source_bytes > ram / 2;
+    if (release) {
+        GGML_LOG_INFO("NPU: %.1f GB of weights, twice resident while converted, against %.1f GB of memory: the GGUF's pages are "
+                      "released as they are converted\n", source_bytes / 1e9, ram / 1e9);
+        for (uint32_t i = 0; i < pick->info.n_sources; ++i) {
+            npudsl_model_source(pick->model, i, &si);
+            const ggml_tensor * t = weights.at(si.name);
+            host_pages(t->data, ggml_nbytes(t), false);
+        }
+    }
     char err[1024];
     npudsl_runner_options options = {};
     options.struct_size = sizeof(options);
@@ -429,13 +517,18 @@ bool bind(npu_device_context & ctx, ggml_cgraph * graph) {
         GGML_LOG_ERROR("NPU: cannot create the runner of %s: %s\n", pick->path.c_str(), err);
         return false;
     }
-    npudsl_source_info si = {};
-    si.struct_size = sizeof(si);
     for (uint32_t i = 0; i < pick->info.n_sources; ++i) {
         npudsl_model_source(pick->model, i, &si);
         const ggml_tensor * t = weights.at(si.name);
         const int64_t ne[4] = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
-        if (npudsl_runner_import(ctx.runner, t->name, ggml_type_name(t->type), ne, 4, t->data, ggml_nbytes(t)) != NPUDSL_OK) {
+        if (release) {
+            host_pages(t->data, ggml_nbytes(t), true);   // one sequential read instead of page faults
+        }
+        const int rc = npudsl_runner_import(ctx.runner, t->name, ggml_type_name(t->type), ne, 4, t->data, ggml_nbytes(t));
+        if (release) {
+            host_pages(t->data, ggml_nbytes(t), false);
+        }
+        if (rc != NPUDSL_OK) {
             GGML_LOG_ERROR("NPU: cannot import %s: %s\n", t->name, npudsl_runner_error(ctx.runner));
             ctx.unbind();
             return false;
