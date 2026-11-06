@@ -90,6 +90,24 @@ after converting the GGUF's weights into the kernels' layout) and `NPU: setup ..
 model directory matches runs on the other backends. For `llama-server` the flags above keep it inside the backend's
 limits (one sequence, no prompt-cache reuse, no state checkpoints); it is not yet validated on hardware.
 
+### Model loading and memory use
+
+The NPU backend supports memory-mapped host weights. With the default
+`--load-mode auto`, llama can use `mmap` when all selected devices support it;
+no extra loading flag is needed for `-dev NPU`. Check for `load_mode = mmap`
+and `CPU_Mapped model buffer` in the loading log.
+
+This matters for models near the machine's RAM capacity: the runner allocates
+its own converted weights, while the original GGUF is still available to the
+host. Unmodified mapped pages can be reclaimed and reread from the GGUF rather
+than retaining a second large private weight allocation. It does not reduce the
+runner's allocation requirements or change the model's precision. Smaller
+models that already fit in RAM may see little speedup.
+
+Explicit `--load-mode none` remains available for diagnostics. It loads weights
+into private host buffers and can make startup much slower under memory
+pressure. Avoid `mlock` / `mmap+mlock` when both weight copies do not fit in RAM.
+
 Where model directories are looked for, first match wins:
 
 1. `GGML_NPU_MODELS`, if set -- a model directory, a directory of model directories, or model.json paths separated by
@@ -154,3 +172,9 @@ through the public llama API against the runner's mock NPU runtime, with a packa
 graph. It checks weights, token ids, positions, ubatch splitting, restart, and the refusal of a split graph. It does
 not check numerics. `test-llama-archs` with the NPU device registered checks that models without a package run
 unchanged.
+
+Static `GGML_NPU` test builds also provide `test-npu-mmap`: it checks the mmap
+capabilities, a zero-copy external host-buffer view, and caller ownership after
+the view is freed. It needs no model or kernels, and skips when no NPU device is
+available (or can run against the mock runtime). Hardware inference still needs
+separate correctness and default-loading performance validation.

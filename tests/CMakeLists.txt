@@ -227,6 +227,11 @@ endif()
 
 llama_build(test-llama-archs.cpp)
 
+if (GGML_NPU AND NOT BUILD_SHARED_LIBS AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-npu-mmap.cpp LINK ggml LABEL "backend")
+    set_tests_properties(test-npu-mmap PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # ggml-npu through the public llama API, with the DSL runner on its mock NPU runtime (no device, no numerics)
 if (GGML_NPU AND GGML_NPU_MOCK_RUNTIME AND NOT BUILD_SHARED_LIBS AND NOT GGML_BACKEND_DL)
     llama_build(test-npu-backend.cpp)

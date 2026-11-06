@@ -740,6 +740,11 @@ void npu_dev_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
     props->description = npu_dev_get_description(dev);
     props->type = npu_dev_get_type(dev);
     npu_dev_get_memory(dev, &props->memory_free, &props->memory_total);
+    // Sources are read from host buffers (including mapped GGUF pages), then
+    // converted into runner-owned NPU memory. Do not make llama's auto loader
+    // allocate another private copy of every weight before those allocations.
+    props->caps.mmap_support = true;
+    props->caps.buffer_from_host_ptr = true;
 }
 
 ggml_backend_t npu_dev_init_backend(ggml_backend_dev_t dev, const char *) {
@@ -792,6 +797,12 @@ ggml_backend_buffer_type_t npu_dev_get_buffer_type(ggml_backend_dev_t) {
     return ggml_backend_cpu_buffer_type();
 }
 
+ggml_backend_buffer_t npu_dev_buffer_from_host_ptr(ggml_backend_dev_t, void * ptr, size_t size, size_t) {
+    // Non-owning CPU view: llama owns the mapping and keeps it alive while its
+    // tensors reference it. Freeing this view must not free or unmap the source.
+    return ggml_backend_cpu_buffer_from_ptr(ptr, size);
+}
+
 const ggml_backend_device_i npu_device_iface = {
     /* .get_name             = */ npu_dev_get_name,
     /* .get_description      = */ npu_dev_get_description,
@@ -801,7 +812,7 @@ const ggml_backend_device_i npu_device_iface = {
     /* .init_backend         = */ npu_dev_init_backend,
     /* .get_buffer_type      = */ npu_dev_get_buffer_type,
     /* .get_host_buffer_type = */ nullptr,
-    /* .buffer_from_host_ptr = */ nullptr,
+    /* .buffer_from_host_ptr = */ npu_dev_buffer_from_host_ptr,
     /* .supports_op          = */ npu_dev_supports_op,
     /* .supports_buft        = */ npu_dev_supports_buft,
     /* .offload_op           = */ nullptr,
