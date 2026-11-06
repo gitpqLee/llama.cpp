@@ -36,6 +36,16 @@
 #    ifndef NOMINMAX
 #        define NOMINMAX
 #    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#endif
+
+#if defined(_WIN32)
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
 #    include <windows.h>
 #else
 #    include <unistd.h>
@@ -65,6 +75,7 @@ struct npu_device_context {
     // what loading the catalog found, logged again by every backend init: the first load can happen while llama
     // silences logging (its memory-fit dry run)
     std::vector<std::pair<ggml_log_level, std::string>> catalog_log;
+    std::string searched;             // where model directories were looked for (logged when none is usable)
     std::vector<bool> consistent;     // per package: accepts every weight claimed so far
     bool matched = false;             // the last weight queried belongs to a consistent package
     std::string rejected;             // why the first rejected weight was refused (bind's error names it)
@@ -170,6 +181,36 @@ void load_path(npu_device_context & ctx, const std::string & path) {
     }
 }
 
+// Where model directories are found when GGML_NPU_MODELS is not set: the build's default (GGML_NPU_MODELS_DIR, by
+// default <NPU_DSL_ROOT>/build/npu_models, where the DSL build installs every model), then the `npu_models` directory
+// next to the executable (a packaged build that ships its models).
+std::vector<std::string> default_model_dirs() {
+    namespace fs = std::filesystem;
+    std::vector<std::string> out;
+#ifdef GGML_NPU_MODELS_DIR
+    out.push_back(GGML_NPU_MODELS_DIR);
+#endif
+    try {
+#if defined(_WIN32)
+        std::wstring exe(32768, L'\0');
+        const DWORD n = GetModuleFileNameW(nullptr, exe.data(), DWORD(exe.size()));
+        if (n > 0 && n < exe.size()) {
+            exe.resize(n);
+            out.push_back((fs::path(exe).parent_path() / "npu_models").string());
+        }
+#else
+        std::error_code ec;
+        const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            out.push_back((exe.parent_path() / "npu_models").string());
+        }
+#endif
+    } catch (const std::exception &) {
+        // a path this locale cannot represent: that location is skipped
+    }
+    return out;
+}
+
 void load_catalog(npu_device_context & ctx) {
     if (ctx.catalog_loaded) {
         return;
@@ -180,7 +221,8 @@ void load_catalog(npu_device_context & ctx) {
 #else
     const char sep = ':';
 #endif
-    if (const char * env = getenv("GGML_NPU_MODELS")) {
+    if (const char * env = getenv("GGML_NPU_MODELS")) {   // set: exactly these, nothing else
+        ctx.searched = std::string("GGML_NPU_MODELS=") + env;
         const std::string list = env;
         size_t start = 0;
         while (start <= list.size()) {
@@ -190,10 +232,15 @@ void load_catalog(npu_device_context & ctx) {
             }
             start = end + 1;
         }
+    } else {
+        for (const auto & dir : default_model_dirs()) {
+            ctx.searched += (ctx.searched.empty() ? "" : ", ") + dir;
+            std::error_code ec;
+            if (std::filesystem::is_directory(dir, ec)) {
+                load_path(ctx, dir);
+            }
+        }
     }
-#ifdef GGML_NPU_MODELS_DIR
-    load_path(ctx, GGML_NPU_MODELS_DIR);
-#endif
     for (const auto & p : ctx.added) {
         load_path(ctx, p);
     }
@@ -611,7 +658,8 @@ ggml_backend_t npu_dev_init_backend(ggml_backend_dev_t dev, const char *) {
             ggml_log_internal(m.first, "%s\n", m.second.c_str());
         }
         if (ctx.catalog.empty()) {
-            GGML_LOG_INFO("NPU: no usable model package (GGML_NPU_MODELS); every model runs on the other backends\n");
+            GGML_LOG_INFO("NPU: no usable model directory (searched %s); every model runs on the other backends\n",
+                          ctx.searched.empty() ? "nothing" : ctx.searched.c_str());
         }
     }
     return new ggml_backend{npu_guid(), npu_backend_iface, dev, nullptr};
