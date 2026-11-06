@@ -24,7 +24,9 @@ GGUF runs on the other backends, unchanged.
   - [libraries.npu.dsl](../../../libraries.npu.dsl) (the NPU DSL, its models and the runner);
   - `frameworks.ai.npu.generic_compute` at the revision of `libraries.npu.dsl/process/generic_compute.pin`, cloned with
     its submodules (`git clone --recursive -b dc/dsl_barrier <remote>`; see "generic_compute setup" in the DSL README);
-  - moviTools (the NPU kernel compiler), needed only to build the models' kernels.
+  - moviTools (the NPU kernel compiler): it compiles the models' kernels, and generic_compute's CMake also requires
+    `MV_TOOLS_PATH` when llama.cpp is configured (its top-level CMakeLists stops without it), so both builds below
+    run with it set. A machine that only runs a shipped build needs neither (section 5).
 
 ## 2. Build (each once)
 
@@ -37,7 +39,7 @@ $DSL   = "C:\path\to\libraries.npu.dsl"
 $LLAMA = "C:\path\to\llama.cpp"
 # a. the models: every model's kernels, installed as model directories into $DSL\build\npu_models
 python "$DSL\model_runner\tools\build_models.py" --generator "Visual Studio 18 2026" --platform x64
-# b. llama.cpp, with no model in it
+# b. llama.cpp, with no model in it (MV_TOOLS_PATH still set: generic_compute's CMake checks it)
 cmake -G "Visual Studio 18 2026" -A x64 -S $LLAMA -B "$LLAMA\build" "-DGGML_NPU=ON" "-DNPU_DSL_ROOT=$DSL" `
       "-DGENERIC_COMPUTE_ROOT=$env:GENERIC_COMPUTE_ROOT" "-DBUILD_SHARED_LIBS=OFF"
 cmake --build "$LLAMA\build" --config Release
@@ -48,7 +50,7 @@ Linux:
 ```sh
 export GENERIC_COMPUTE_ROOT=<generic_compute> MV_TOOLS_PATH=<moviTools>
 python <libraries.npu.dsl>/model_runner/tools/build_models.py
-cmake -B build -DGGML_NPU=ON -DNPU_DSL_ROOT=<libraries.npu.dsl> -DGENERIC_COMPUTE_ROOT=$GENERIC_COMPUTE_ROOT
+cmake -B build -DGGML_NPU=ON -DNPU_DSL_ROOT=<libraries.npu.dsl> -DGENERIC_COMPUTE_ROOT=$GENERIC_COMPUTE_ROOT   # MV_TOOLS_PATH set
 cmake --build build --config Release
 ```
 
@@ -107,6 +109,7 @@ the GGUFs. The target machine needs the NPU driver only -- no DSL repository, mo
 | Message | Meaning / action |
 | --- | --- |
 | `NPU: no usable model directory (searched ...)` | no model directory where the backend looked: run step 2a, or set `GGML_NPU_MODELS` |
+| `CMake Error at <generic_compute>/CMakeLists.txt:11: MV_TOOLS_PATH environment variable is not defined` | configuring llama.cpp with `GGML_NPU=ON` needs `MV_TOOLS_PATH` set (generic_compute's CMake), even though it compiles no kernel |
 | `NPU: ignoring model package ...: built for 5010/3 tiles, device is ...` | the kernels are for another NPU generation |
 | `NPU: the GGUF does not fit the model package: <tensor> is <type> [...]; <model> takes ...` | a GGUF in another format (e.g. from `llama-quantize`): convert with step 3 |
 | `group G of 128 values has 32-blocks with different scales` | a Q4_0 with per-32 scales: convert with step 3 |
