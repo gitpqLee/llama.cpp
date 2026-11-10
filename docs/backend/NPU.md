@@ -104,9 +104,22 @@ than retaining a second large private weight allocation. It does not reduce the
 runner's allocation requirements or change the model's precision. Smaller
 models that already fit in RAM may see little speedup.
 
+A large model on a machine with tight memory still takes seconds to tens of
+seconds to load. While the runner converts the weights, both the GGUF and the
+converted weights are in memory. To allocate the converted weights, the system
+first has to evict the GGUF's mapped pages, and the conversion rereads some of
+them from disk. Measured on a 32 GB PTL machine:
+
+- Qwen3.6-35B-A3B (20.6 GB of weights): `NPU: setup` 12-13 s (create 7.6-8.6
+  s, imports 3.5 s). Create is 1.6 s with free memory.
+- Qwen3-4B: setup 1.5 s.
+
+More free RAM shortens this; it is not a fault.
+
 Explicit `--load-mode none` remains available for diagnostics. It loads weights
 into private host buffers and can make startup much slower under memory
-pressure. Avoid `mlock` / `mmap+mlock` when both weight copies do not fit in RAM.
+pressure: the same Qwen3.6 run took 179 s to create. Avoid `mlock` /
+`mmap+mlock` when both weight copies do not fit in RAM.
 
 Where model directories are looked for, first match wins:
 
