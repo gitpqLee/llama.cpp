@@ -104,8 +104,9 @@ void probe(npu_device_context & ctx) {
         GGML_LOG_DEBUG("%s: no NPU: %s\n", __func__, err);
         return;
     }
-    ctx.key = key;
-    ctx.description = "Intel NPU " + ctx.key + " (" + std::to_string(ctx.tiles) + " tiles), whole-model DSL kernels";
+    ctx.key = key;   // "" and 0 tiles: the NPU runtime does not report them (packages are then not filtered by target)
+    ctx.description = ctx.key.empty() ? std::string("Intel NPU, whole-model DSL kernels")
+                                      : "Intel NPU " + ctx.key + " (" + std::to_string(ctx.tiles) + " tiles), whole-model DSL kernels";
 }
 
 void note(npu_device_context & ctx, ggml_log_level level, const std::string & message) {
@@ -133,7 +134,7 @@ bool load_package(npu_device_context & ctx, const std::string & path) {
         note(ctx, GGML_LOG_LEVEL_WARN, "NPU: ignoring model package " + path + ": it has no GGUF sources");
         return false;
     }
-    if (ctx.present && (info.device_key != ctx.key || info.tiles != ctx.tiles)) {
+    if (ctx.present && !ctx.key.empty() && (info.device_key != ctx.key || (ctx.tiles && info.tiles != ctx.tiles))) {
         note(ctx, GGML_LOG_LEVEL_WARN, "NPU: ignoring model package " + path + ": built for " + info.device_key + "/" +
                                            std::to_string(info.tiles) + " tiles, device is " + ctx.key + "/" +
                                            std::to_string(ctx.tiles) + " tiles");
