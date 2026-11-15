@@ -564,11 +564,17 @@ ggml_status evaluate(npu_device_context & ctx, const ggml_tensor * ids, ggml_cgr
     const auto tokens = read_i32(ids, n);
     size_t pos0 = npudsl_runner_position(ctx.runner);
     if (std::string(ctx.bound->info.source_positions) == "rope") {
+        // the token positions: llama.cpp's inp_pos when a rope reads it (other ropes may rotate by derived positions,
+        // e.g. pooled keys at block positions), else the first rope's
         const ggml_tensor * pos = nullptr;
-        for (int i = 0; i < ggml_graph_n_nodes(graph) && !pos; ++i) {
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             const ggml_tensor * node = ggml_graph_node(graph, i);
             if (node->op == GGML_OP_ROPE && node->src[1] && live(node)) {
-                pos = node->src[1];
+                if (std::strcmp(ggml_get_name(node->src[1]), "inp_pos") == 0) {
+                    pos = node->src[1];
+                    break;
+                }
+                if (!pos) { pos = node->src[1]; }
             }
         }
         if (!pos) {
