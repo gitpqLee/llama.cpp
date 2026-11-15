@@ -93,7 +93,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
         # the MTP head never reads PLE, so an MTP-only file carries none of it
-        ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
+        ple_layers = [i - 1 for i in hp.get("ple_layer_ids") or []]   # null in checkpoints without PLE
         if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
