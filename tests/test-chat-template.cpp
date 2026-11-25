@@ -352,6 +352,57 @@ static common_chat_msg simple_msg(const std::string & role, const std::string & 
 int main_automated_tests(void) {
     // jinja::enable_debug(true);
 
+    // Qwen4 base GGUF: latest-message-only rendering must not subtract the
+    // previous answer's length. Cover shorter, longer, identical and prefix
+    // cases, including assistant bookkeeping and a third user turn.
+    {
+        auto tmpls = common_chat_templates_init(nullptr, "{{ messages[-1]['content'] }}");
+        std::vector<common_chat_msg> history;
+        const std::vector<std::pair<std::string, std::string>> turns = {
+            {"user", "2+3=?"},
+            {"assistant", "The answer is 5. This answer is longer than the next question."},
+            {"user", "openvino \xe6\x98\xaf\xe4\xbb\x80\xe4\xb9\x88"},
+            {"assistant", "OpenVINO optimizes inference."},
+            {"user", "1+1=?"},
+            {"assistant", "same"},
+            {"user", "same"},
+            {"assistant", "prefix"},
+            {"user", "prefix plus a longer question"},
+        };
+        for (const auto & turn : turns) {
+            common_chat_msg msg;
+            msg.role = turn.first;
+            msg.content = turn.second;
+            assert(common_chat_format_single(tmpls.get(), history, msg, msg.role == "user", true) == msg.content);
+            history.push_back(msg);
+        }
+    }
+    // Ordinary append-only chat templates must keep the existing incremental
+    // framing, rather than duplicate history or discard role/generation tags.
+    for (const std::string & source : {
+             std::string("{% for m in messages %}{{ '<|im_start|>' + m['role'] + '\\n' + m['content'] + '<|im_end|>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"),
+             std::string("{% if messages[0]['role'] != 'user' %}{{ raise_exception('First message must be user') }}{% endif %}{% for m in messages %}{{ '<start_of_turn>' + m['role'] + '\\n' + m['content'] + '<end_of_turn>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<start_of_turn>model\\n' }}{% endif %}")}) {
+        auto tmpls = common_chat_templates_init(nullptr, source);
+        std::vector<common_chat_msg> history;
+        for (const std::string & role : {std::string("user"), std::string("assistant"), std::string("user")}) {
+            common_chat_msg msg;
+            msg.role = role;
+            msg.content = "test";
+            common_chat_templates_inputs inputs;
+            inputs.use_jinja = true;
+            inputs.messages = history;
+            inputs.add_generation_prompt = false;
+            std::string past = history.empty() ? "" : common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+            inputs.messages.push_back(msg);
+            inputs.add_generation_prompt = role == "user";
+            std::string full = common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+            std::string expected = (role == "user" && !past.empty() && past.back() == '\n' ? "\n" : "") + full.substr(past.size());
+            assert(common_chat_format_single(tmpls.get(), history, msg, role == "user", true) == expected);
+            history.push_back(msg);
+        }
+    }
+    std::cout << "PASS: incremental latest-message and append-only template regressions\n";
+
     std::vector<llama_chat_message> conversation {
         {"system", "You are a helpful assistant"},
         {"user", "Hello"},

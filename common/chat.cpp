@@ -753,15 +753,39 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
         inputs.add_generation_prompt = false;
         fmt_past_msg                 = common_chat_templates_apply(tmpls, inputs).prompt.str();
     }
-    std::ostringstream ss;
-    // if the past_msg ends with a newline, we must preserve it in the formatted version
-    if (add_ass && !fmt_past_msg.empty() && fmt_past_msg.back() == '\n') {
-        ss << "\n";
-    };
     // format chat with new_msg
     inputs.messages.push_back(new_msg);
     inputs.add_generation_prompt = add_ass;
     auto fmt_new_msg             = common_chat_templates_apply(tmpls, inputs).prompt.str();
+    if (!past_msg.empty()) {
+        // Some base-model templates render only the latest message, not an
+        // append-only transcript. Do not slice off the previous answer (or
+        // silently truncate a new message that happens to share its prefix).
+        auto single_inputs = inputs;
+        single_inputs.messages = { new_msg };
+        const bool extends_past = fmt_new_msg.compare(0, fmt_past_msg.size(), fmt_past_msg) == 0;
+        try {
+            auto fmt_single_msg = common_chat_templates_apply(tmpls, single_inputs).prompt.str();
+            if (fmt_new_msg == fmt_single_msg) {
+                return fmt_single_msg;
+            }
+            if (!extends_past) {
+                LOG_WRN("%s: template rewrites history; formatting the new message independently\n", __func__);
+                return fmt_single_msg;
+            }
+        } catch (const std::exception &) {
+            // Strict alternating-role templates can reject an isolated
+            // assistant message. Their valid append-only rendering is enough.
+            if (!extends_past) {
+                throw;
+            }
+        }
+    }
+    std::ostringstream ss;
+    // if the past_msg ends with a newline, we must preserve it in the formatted version
+    if (add_ass && !fmt_past_msg.empty() && fmt_past_msg.back() == '\n') {
+        ss << "\n";
+    }
     // get the diff part
     ss << fmt_new_msg.substr(fmt_past_msg.size(), fmt_new_msg.size() - fmt_past_msg.size());
     return ss.str();

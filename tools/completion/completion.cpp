@@ -903,7 +903,18 @@ int llama_completion(int argc, char ** argv) {
                     // reset assistant message
                     assistant_ss.str("");
 
-                    n_remain -= line_inp.size();
+                    if (params.interactive && params.conversation_mode) {
+                        // Each accepted nonempty user message starts a fresh output
+                        // budget, including after EOS or an interrupted response.
+                        // Prompt/template tokens do not consume this budget.
+                        if (params.n_predict >= 0) {
+                            n_remain = params.n_predict;
+                            LOG_DBG("conversation output budget reset: %d\n", n_remain);
+                        }
+                    } else {
+                        // Preserve legacy non-conversation input accounting.
+                        n_remain -= line_inp.size();
+                    }
                     LOG_DBG("n_remain: %d\n", n_remain);
                 }
 
